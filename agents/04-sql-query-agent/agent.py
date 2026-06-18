@@ -1,26 +1,23 @@
-"""
-SQL Query Agent using LangChain.
-
-Connects to a SQLite database and answers natural language questions
-by generating and executing SQL queries.
-
-Usage:
-    python agent.py                          # uses demo database
-    python agent.py --db path/to/db.sqlite   # your database
-    python agent.py --db mydb.sqlite --question "How many users signed up last month?"
-"""
-
 import argparse
 import os
+import re
 import sqlite3
 from urllib.parse import quote
 
 from dotenv import load_dotenv
+from langchain_community.agent_toolkits import create_sql_agent, SQLDatabaseToolkit
 from langchain_community.utilities import SQLDatabase
 from langchain_openai import ChatOpenAI
-from langchain.agents import create_sql_agent
-from langchain.agents.agent_toolkits import SQLDatabaseToolkit
-from langchain.agents.agent_types import AgentType
+
+
+def clean_output(text: str) -> str:
+    """Remove common Markdown formatting for terminal display."""
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)  # **bold**
+    text = re.sub(r'__(.+?)__', r'\1', text)       # __bold__
+    text = re.sub(r'`(.+?)`', r'\1', text)          # `code`
+    text = re.sub(r'^#+\s*', '', text, flags=re.MULTILINE)  # ## headings
+    return text
+
 
 load_dotenv()
 
@@ -74,6 +71,20 @@ def create_demo_database(db_path: str):
     conn.close()
 
 
+def mysql_uri() -> str:
+    """Build a MySQL URI from environment variables: DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME.
+    Raises ValueError if DB_HOST is not set.
+    """
+    host = os.environ.get("DB_HOST")
+    if not host:
+        raise ValueError("DB_HOST not set in .env — cannot connect to MySQL")
+    port = os.environ.get("DB_PORT", "3306")
+    user = os.environ.get("DB_USER", "root")
+    password = quote(os.environ.get("DB_PASSWORD", ""))
+    db_name = os.environ.get("DB_NAME", "")
+    return f"mysql+pymysql://{user}:{password}@{host}:{port}/{db_name}"
+
+
 def sqlite_uri(db_path: str, read_only: bool = True) -> str:
     abs_path = os.path.abspath(db_path)
     if read_only:
@@ -81,39 +92,54 @@ def sqlite_uri(db_path: str, read_only: bool = True) -> str:
     return f"sqlite:///{abs_path}"
 
 
-def build_agent(db_path: str, read_only: bool = True):
-    db = SQLDatabase.from_uri(sqlite_uri(db_path, read_only=read_only))
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+def build_agent(db_path: str, read_only: bool = True, use_mysql: bool = False):
+    if use_mysql:
+        db = SQLDatabase.from_uri(mysql_uri())
+    else:
+        db = SQLDatabase.from_uri(sqlite_uri(db_path, read_only=read_only))
+    llm = ChatOpenAI(
+        model="deepseek-chat",
+        temperature=0,
+        base_url="http://localhost:3000/v1",
+    )
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
     agent = create_sql_agent(
         llm=llm,
         toolkit=toolkit,
-        agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+        agent_type="tool-calling",
         verbose=False,
+        agent_executor_kwargs={"handle_parsing_errors": True},
     )
     return agent, db
 
 
 def main():
     parser = argparse.ArgumentParser(description="SQL Query Agent")
-    parser.add_argument("--db", default="demo.sqlite", help="SQLite database path")
+    parser.add_argument("--db", default="demo.sqlite", help="SQLite database path (default: demo.sqlite)")
+    parser.add_argument("--mysql", action="store_true", help="Connect to MySQL instead of SQLite (reads DB_HOST/DB_USER/DB_PASSWORD/DB_NAME from .env)")
     parser.add_argument("--question", help="Natural language question (omit for interactive)")
     parser.add_argument("--allow-write", action="store_true", help="Open the SQLite database read-write instead of read-only")
     args = parser.parse_args()
 
-    if args.db == "demo.sqlite" and not os.path.exists("demo.sqlite"):
+    if not args.mysql and args.db == "demo.sqlite" and not os.path.exists("demo.sqlite"):
         print("🏗️  Creating demo e-commerce database...")
         create_demo_database("demo.sqlite")
 
-    agent, db = build_agent(args.db, read_only=not args.allow_write)
-    print(f"\n📊 Connected to: {args.db}")
-    print(f"🔒 Mode: {'read-write' if args.allow_write else 'read-only'}")
-    print(f"📋 Tables: {', '.join(db.get_table_names())}\n")
+    agent, db = build_agent(args.db, read_only=not args.allow_write, use_mysql=args.mysql)
+
+    if args.mysql:
+        host = os.environ.get("DB_HOST", "?")
+        db_name = os.environ.get("DB_NAME", "?")
+        print(f"\n📊 Connected to MySQL: {host}/{db_name}")
+    else:
+        print(f"\n📊 Connected to: {args.db}")
+        print(f"🔒 Mode: {'read-write' if args.allow_write else 'read-only'}")
+    print(f"📋 Tables: {', '.join(db.get_usable_table_names())}\n")
 
     if args.question:
         print(f"❓ Question: {args.question}")
         result = agent.invoke({"input": args.question})
-        print(f"\n✅ Answer: {result['output']}")
+        print(f"\n✅ Answer: {clean_output(result['output'])}")
     else:
         print("💬 SQL Agent ready. Ask questions in natural language. Type 'quit' to exit.\n")
         while True:
@@ -123,8 +149,9 @@ def main():
             if not question:
                 continue
             result = agent.invoke({"input": question})
-            print(f"\nAgent: {result['output']}\n")
+            print(f"\nAgent: {clean_output(result['output'])}\n")
 
 
 if __name__ == "__main__":
     main()
+
